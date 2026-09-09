@@ -26,7 +26,7 @@ use crate::locale;
 use crate::notifier::{self, BackgroundNotifier, Notifier, NullNotifier};
 use crate::output_writer;
 use crate::server;
-use crate::session::{self, KeyBindings, Metadata, TermInfo};
+use crate::session::{self, KeyBindings, Metadata, Sink, TermInfo};
 use crate::status;
 use crate::stream::Stream;
 use crate::tty::{self, DevTty, FixedSizeTty, NullTty, RawTty};
@@ -94,11 +94,11 @@ impl cli::Session {
 
         let stream = Stream::new();
         let shutdown_token = CancellationToken::new();
-        let mut outputs: Vec<Box<dyn session::Output>> = Vec::new();
+        let capture_input = self.capture_input || config.session.capture_input;
+        let mut sinks: Vec<Sink> = Vec::new();
 
         if let Some(file_output) = file_output {
-            let output = file_output.start().await?;
-            outputs.push(Box::new(output));
+            sinks.push(Sink::new(file_output.start().await?).capture_input(capture_input));
         }
 
         let server = listener.map(|listener| {
@@ -119,8 +119,7 @@ impl cli::Session {
         });
 
         if server.is_some() || forwarder.is_some() {
-            let output = stream.start(&metadata).await;
-            outputs.push(Box::new(output));
+            sinks.push(Sink::new(stream.start(&metadata).await).capture_input(capture_input));
         }
 
         let command = &build_exec_command(command.as_ref().cloned());
@@ -129,16 +128,7 @@ impl cli::Session {
         let exit_status = {
             let mut raw_tty = tty.open_raw().await?;
 
-            session::run(
-                command,
-                extra_env,
-                raw_tty.as_mut(),
-                self.capture_input || config.session.capture_input,
-                outputs,
-                keys,
-                notifier,
-            )
-            .await?
+            session::run(command, extra_env, raw_tty.as_mut(), sinks, keys, notifier).await?
         };
 
         status::info!("asciinema session ended");
