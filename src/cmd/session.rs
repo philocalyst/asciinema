@@ -98,7 +98,7 @@ impl cli::Session {
         let mut sinks: Vec<Sink> = Vec::new();
 
         if let Some(file_output) = file_output {
-            sinks.push(Sink::new(file_output.start().await?).capture_input(capture_input));
+            sinks.push(Sink::new(file_output.start().await?));
         }
 
         let server = listener.map(|listener| {
@@ -119,16 +119,25 @@ impl cli::Session {
         });
 
         if server.is_some() || forwarder.is_some() {
-            sinks.push(Sink::new(stream.start(&metadata).await).capture_input(capture_input));
+            sinks.push(Sink::new(stream.start(&metadata).await));
         }
 
         let command = &build_exec_command(command.as_ref().cloned());
         let extra_env = &build_exec_extra_env(&self.env, relay_id.as_ref());
 
-        let exit_status = {
+        let session_result = {
             let mut raw_tty = tty.open_raw().await?;
 
-            session::run(command, extra_env, raw_tty.as_mut(), sinks, keys, notifier).await?
+            session::run(
+                command,
+                extra_env,
+                raw_tty.as_mut(),
+                capture_input,
+                sinks,
+                keys,
+                notifier,
+            )
+            .await
         };
 
         status::info!("asciinema session ended");
@@ -149,7 +158,7 @@ impl cli::Session {
             let _ = time::timeout(Duration::from_secs(5), task).await;
         }
 
-        Ok(exit_status)
+        session_result
     }
 
     fn get_command(&self, config: &config::Session) -> Option<String> {

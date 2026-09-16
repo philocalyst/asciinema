@@ -49,6 +49,7 @@ pub struct TermInfo {
 }
 
 struct Session<N: Notifier> {
+    capture_input: bool,
     epoch: Instant,
     events_tx: mpsc::Sender<Event>,
     input_decoder: Utf8Decoder,
@@ -58,7 +59,6 @@ struct Session<N: Notifier> {
     pause_time: Option<Duration>,
     prefix_mode: bool,
     time_offset: Duration,
-    capture_input: bool,
     tty_size: TtySize,
 }
 
@@ -71,41 +71,51 @@ pub trait Output: Send {
 /// An [`Output`], plus how the session treats it.
 ///
 /// Sinks are fed concurrently, in the order the events happen. A sink which
-/// fails is dropped from the fan-out.
+/// fails is dropped from the fan-out, and only an essential one fails the
+/// session along with it.
 pub struct Sink {
     output: Box<dyn Output>,
-    capture_input: bool,
+    essential: bool,
 }
 
 impl Sink {
     pub fn new(output: impl Output + 'static) -> Self {
         Self {
             output: Box::new(output),
-            capture_input: false,
+            essential: false,
         }
     }
 
-    /// Feeds the output keyboard input too. Input is read from the terminal
-    /// only when some sink asks for it, and reaches only the sinks which do.
-    pub fn capture_input(mut self, capture_input: bool) -> Self {
-        self.capture_input = capture_input;
+    /// Makes a failure of the output fail the session. Failures of ordinary
+    /// sinks are only logged.
+    pub fn essential(mut self) -> Self {
+        self.essential = true;
 
         self
     }
 
     async fn event(&mut self, event: &Event) -> io::Result<()> {
-        if matches!(event, Event::Input(..)) && !self.capture_input {
-            return Ok(());
-        }
-
         self.output.event(event.clone()).await
+    }
+
+    /// Reports a failure, keeping the first one which fails the session.
+    fn failed(&self, error: io::Error, failure: &mut Option<io::Error>) {
+        if self.essential {
+            failure.get_or_insert(error);
+        } else {
+            error!("output failed: {error:?}");
+        }
     }
 }
 
+/// Runs `command` in a pty, feeding its terminal output - and, when
+/// `capture_input` is on, the input it gets from the keyboard - to every
+/// sink.
 pub async fn run<S: AsRef<str>, T: RawTty + ?Sized, N: Notifier>(
     command: &[S],
     extra_env: &HashMap<String, String>,
     tty: &mut T,
+    capture_input: bool,
     sinks: Vec<Sink>,
     keys: KeyBindings,
     notifier: N,
@@ -113,11 +123,11 @@ pub async fn run<S: AsRef<str>, T: RawTty + ?Sized, N: Notifier>(
     let epoch = Instant::now();
     let (events_tx, events_rx) = mpsc::channel::<Event>(1024);
     let winsize = tty.get_size();
-    let capture_input = sinks.iter().any(|sink| sink.capture_input);
     let pty = pty::spawn(command, winsize, extra_env)?;
     let forwarder = tokio::spawn(forward_events(events_rx, sinks));
 
     let session = Session {
+        capture_input,
         epoch,
         events_tx,
         input_decoder: Utf8Decoder::new(),
@@ -126,23 +136,35 @@ pub async fn run<S: AsRef<str>, T: RawTty + ?Sized, N: Notifier>(
         output_decoder: Utf8Decoder::new(),
         pause_time: None,
         prefix_mode: false,
-        capture_input,
         time_offset: Duration::from_micros(0),
         tty_size: winsize.into(),
     };
 
     let result = session.run(pty, tty).await;
 
-    // Wait for the sinks to be finished before reporting the session's exit
-    // status, so that the recording is flushed and closed either way.
-    let _ = forwarder.await;
+    // Wait for the sinks to be finished, so that the recording is flushed and
+    // closed before a failure is reported.
+    let sink_error = forwarder
+        .await
+        .map_err(|e| anyhow::anyhow!("event forwarder failed: {e}"))?;
 
-    result
+    // The session's own failure takes precedence over a failed sink.
+    let status = result?;
+
+    match sink_error {
+        Some(error) => Err(error.into()),
+        None => Ok(status),
+    }
 }
 
 /// Feeds session events to all sinks until the session ends, then finishes
-/// them.
-async fn forward_events(mut events_rx: mpsc::Receiver<Event>, mut sinks: Vec<Sink>) {
+/// them. Returns the first failure of an essential sink, if any.
+async fn forward_events(
+    mut events_rx: mpsc::Receiver<Event>,
+    mut sinks: Vec<Sink>,
+) -> Option<io::Error> {
+    let mut failure = None;
+
     while let Some(event) = events_rx.recv().await {
         let results = future::join_all(sinks.iter_mut().map(|sink| sink.event(&event))).await;
 
@@ -153,7 +175,7 @@ async fn forward_events(mut events_rx: mpsc::Receiver<Event>, mut sinks: Vec<Sin
                 Ok(()) => Some(sink),
 
                 Err(e) => {
-                    error!("output failed: {e:?}");
+                    sink.failed(e, &mut failure);
                     None
                 }
             })
@@ -162,9 +184,11 @@ async fn forward_events(mut events_rx: mpsc::Receiver<Event>, mut sinks: Vec<Sin
 
     for mut sink in sinks {
         if let Err(e) = sink.output.finish().await {
-            error!("output finish failed: {e:?}");
+            sink.failed(e, &mut failure);
         }
     }
+
+    failure
 }
 
 impl<N: Notifier> Session<N> {
