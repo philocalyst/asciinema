@@ -18,6 +18,7 @@ mod player;
 mod pty;
 mod server;
 mod session;
+mod spawn;
 mod status;
 mod stream;
 mod tty;
