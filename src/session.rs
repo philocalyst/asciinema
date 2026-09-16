@@ -408,31 +408,51 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nix::pty::Winsize;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::encoder::AsciicastV3Encoder;
+    use crate::file_output::FileOutput;
+    use crate::hook::Hook;
     use crate::notifier::NullNotifier;
+    use crate::output_writer;
+    use crate::spawn::Context;
 
-    /// An output which remembers what it was fed.
+    /// How a [`TestOutput`] fails, when it does.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fails {
+        Events,
+        Finish,
+    }
+
+    /// An output which remembers what it was fed, and can be made to fail.
     #[derive(Default)]
     struct TestOutput {
         events: Arc<Mutex<Vec<Event>>>,
+        fail: Option<Fails>,
     }
-
-    /// A tty which yields one burst of input, and then nothing ever again.
-    struct TestTty(Mutex<Option<Vec<u8>>>);
 
     #[async_trait]
     impl Output for TestOutput {
         async fn event(&mut self, event: Event) -> io::Result<()> {
+            if self.fail == Some(Fails::Events) {
+                return Err(io::Error::other("event failed"));
+            }
             self.events.lock().unwrap().push(event);
-
             Ok(())
         }
 
         async fn finish(&mut self) -> io::Result<()> {
-            Ok(())
+            if self.fail == Some(Fails::Finish) {
+                Err(io::Error::other("finish failed"))
+            } else {
+                Ok(())
+            }
         }
     }
+
+    /// A tty which yields one burst of input, and then nothing ever again.
+    struct TestTty(Mutex<Option<Vec<u8>>>);
 
     #[async_trait(?Send)]
     impl RawTty for TestTty {
@@ -448,10 +468,8 @@ mod tests {
         async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
             if let Some(input) = self.0.lock().unwrap().take() {
                 buf[..input.len()].copy_from_slice(&input);
-
                 return Ok(input.len());
             }
-
             pending().await
         }
 
@@ -460,31 +478,33 @@ mod tests {
         }
     }
 
-    fn test_sink(capture_input: bool) -> (Sink, Arc<Mutex<Vec<Event>>>) {
+    fn test_sink() -> (Sink, Arc<Mutex<Vec<Event>>>) {
         let output = TestOutput::default();
         let events = output.events.clone();
-
-        (Sink::new(output).capture_input(capture_input), events)
+        (Sink::new(output), events)
     }
 
-    fn input_texts(events: &Mutex<Vec<Event>>) -> Vec<String> {
+    /// Extracts inputs or outputs from the recorded test events
+    fn extract_texts(events: &Mutex<Vec<Event>>, is_input: bool) -> Vec<String> {
         events
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|event| match event {
-                Event::Input(_, text) => Some(text.clone()),
+            .filter_map(|e| match (is_input, e) {
+                (true, Event::Input(_, text)) => Some(text.clone()),
+                (false, Event::Output(_, text)) => Some(text.clone()),
                 _ => None,
             })
             .collect()
     }
 
     /// Runs a session which reads a single line from the tty.
-    async fn read_line(input: &str, sinks: Vec<Sink>) -> i32 {
+    async fn read_line(input: &str, capture_input: bool, sinks: Vec<Sink>) -> i32 {
         run(
             &["sh", "-c", "read value"],
             &HashMap::new(),
             &mut TestTty(Mutex::new(Some(input.as_bytes().to_vec()))),
+            capture_input,
             sinks,
             KeyBindings::default(),
             NullNotifier,
@@ -494,24 +514,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_reaches_only_the_sinks_asking_for_it() {
-        let (listener, listened) = test_sink(true);
-        let (bystander, witnessed) = test_sink(false);
+    async fn test_sink_routing_and_fault_tolerance() {
+        // Scenario A: Input filtering logic across multiple sinks
+        for capture_input in [true, false] {
+            let (healthy1, events1) = test_sink();
+            let (healthy2, events2) = test_sink();
 
-        let status = read_line("hi\n", vec![listener, bystander]).await;
+            assert_eq!(
+                read_line("hi\n", capture_input, vec![healthy1, healthy2]).await,
+                0
+            );
 
-        assert_eq!(status, 0);
-        assert_eq!(input_texts(&listened), ["hi\n"]);
-        assert!(input_texts(&witnessed).is_empty());
-        assert!(!witnessed.lock().unwrap().is_empty());
+            let expected: Vec<&str> = if capture_input { vec!["hi\n"] } else { vec![] };
+            assert_eq!(extract_texts(&events1, true), expected);
+            assert_eq!(extract_texts(&events2, true), expected);
+        }
+
+        // Scenario B: Sink failure logic (Essential vs Non-essential & Event vs Finish failures)
+        for fail_stage in [Fails::Events, Fails::Finish] {
+            for essential in [true, false] {
+                let (healthy, events) = test_sink();
+                let failing_output = TestOutput {
+                    fail: Some(fail_stage),
+                    ..Default::default()
+                };
+
+                let failing_sink = if essential {
+                    Sink::new(failing_output).essential()
+                } else {
+                    Sink::new(failing_output)
+                };
+
+                let (events_tx, events_rx) = mpsc::channel(2);
+                events_tx
+                    .send(Event::Output(Duration::from_secs(1), "a".to_owned()))
+                    .await
+                    .unwrap();
+                events_tx
+                    .send(Event::Output(Duration::from_secs(1), "b".to_owned()))
+                    .await
+                    .unwrap();
+                drop(events_tx);
+
+                let failure = forward_events(events_rx, vec![failing_sink, healthy]).await;
+
+                // Only essential failures crash the session.
+                assert_eq!(failure.is_some(), essential);
+                // Regardless of the other sink failing, the healthy one gets everything.
+                assert_eq!(extract_texts(&events, false), vec!["a", "b"]);
+            }
+        }
     }
 
     #[tokio::test]
-    async fn input_is_not_captured_when_no_sink_wants_it() {
-        let (sink, events) = test_sink(false);
+    async fn test_live_hook_and_recording_parity() {
+        // Verifies that hooks mirror the recording file exactly,
+        // validating both metadata inclusion and the conditional rendering of input events.
+        for capture_input in [true, false] {
+            let dir = tempdir().unwrap();
+            let hook_path = dir.path().join("hook.cast");
+            let recording_path = dir.path().join("recording.cast");
 
-        read_line("secret\n", vec![sink]).await;
+            let metadata = Metadata {
+                time: SystemTime::now(),
+                term: TermInfo {
+                    type_: None,
+                    version: None,
+                    size: TtySize(80, 24),
+                    theme: None,
+                },
+                idle_time_limit: None,
+                command: None,
+                title: None,
+                env: HashMap::new(),
+            };
 
-        assert!(input_texts(&events).is_empty());
+            let hook = Hook(format!("cat > {}", hook_path.display()))
+                .start(
+                    &metadata,
+                    &Context {
+                        session_id: "test-session",
+                        output_file: recording_path.to_str(),
+                        server_url: None,
+                    },
+                    Box::new(NullNotifier),
+                )
+                .unwrap();
+
+            let file = std::fs::File::create(&recording_path).unwrap();
+            let recording = Sink::new(
+                FileOutput::new(
+                    output_writer::new(file, false).unwrap(),
+                    Box::new(AsciicastV3Encoder::new(false)),
+                    Box::new(NullNotifier),
+                    metadata,
+                )
+                .start()
+                .await
+                .unwrap(),
+            );
+
+            read_line("hunter2\n", capture_input, vec![hook, recording]).await;
+
+            let hook_stream = std::fs::read_to_string(&hook_path).unwrap();
+            let recording_stream = std::fs::read_to_string(&recording_path).unwrap();
+
+            // The hook must see exactly the bytes of the recording file.
+            assert_eq!(hook_stream, recording_stream);
+
+            // Ensure capturing behavior translates to the payload.
+            if capture_input {
+                assert!(hook_stream.contains(r#""i", "hunter2\n""#), "{hook_stream}");
+                assert!(hook_stream.lines().last().unwrap().contains(r#""x""#));
+            } else {
+                assert!(!hook_stream.contains(r#""i", "#), "{hook_stream}");
+            }
+        }
     }
 }
