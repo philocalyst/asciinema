@@ -9,6 +9,7 @@ mod fd;
 mod file_output;
 mod forwarder;
 mod hash;
+mod hook;
 mod html;
 mod leb128;
 mod locale;
